@@ -28,7 +28,7 @@ except LookupError:
     print("NLTK data download complete!")
 
 class TextPreprocessor:
-    def __init__(self, min_freq=2, max_vocab_size=10000):
+    def __init__(self, min_freq=1, max_vocab_size=10000):
         self.min_freq = min_freq
         self.max_vocab_size = max_vocab_size
         self.lemmatizer = WordNetLemmatizer()
@@ -111,14 +111,15 @@ class TextPreprocessor:
         
         for i in range(len(processed_tokens) - seq_length):
             sequence = processed_tokens[i:i + seq_length]
-            target = processed_tokens[i + seq_length]
+            # Create targets for each position in the sequence
+            sequence_targets = processed_tokens[i+1:i + seq_length + 1]
             
             # Convert to indices
             sequence = [self.vocab.get(word, self.vocab['<UNK>']) for word in sequence]
-            target = self.vocab.get(target, self.vocab['<UNK>'])
+            sequence_targets = [self.vocab.get(word, self.vocab['<UNK>']) for word in sequence_targets]
             
             sequences.append(sequence)
-            targets.append(target)
+            targets.append(sequence_targets)
             
         return sequences, targets
 
@@ -134,7 +135,7 @@ class TextDataset(Dataset):
         return self.sequences[idx], self.targets[idx]
 
 class LightweightTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=1, dim_feedforward=256, dropout=0.1):
+    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=2, dim_feedforward=256, dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = nn.Parameter(torch.randn(1, 16, d_model))
@@ -157,7 +158,7 @@ class LightweightTransformer(nn.Module):
         x = self.decoder(x)
         return x
 
-def train_model(model, train_loader, optimizer, criterion, device, num_epochs=5):
+def train_model(model, train_loader, optimizer, criterion, device, vocab, num_epochs=5):
     model.train()
     best_loss = float('inf')
     
@@ -167,11 +168,10 @@ def train_model(model, train_loader, optimizer, criterion, device, num_epochs=5)
             data, target = data.to(device), target.to(device)
             
             optimizer.zero_grad()
-            output = model(data)
-            output = output.view(-1, output.size(-1))
-            target = target.view(-1)
+            output = model(data)  # Shape: (batch_size, seq_length, vocab_size)
             
-            loss = criterion(output, target)
+            # Calculate loss without reshaping
+            loss = criterion(output.view(-1, output.size(-1)), target.view(-1))
             loss.backward()
             optimizer.step()
             
@@ -190,6 +190,7 @@ def train_model(model, train_loader, optimizer, criterion, device, num_epochs=5)
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_loss,
+            'vocab': vocab  # Save vocabulary
         }, model_path)
         print(f'Model saved to {model_path}')
         
@@ -203,6 +204,7 @@ def train_model(model, train_loader, optimizer, criterion, device, num_epochs=5)
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
+                'vocab': vocab  # Save vocabulary
             }, best_model_path)
             print(f'Best model saved to {best_model_path}')
 
@@ -223,16 +225,52 @@ def predict_next_word(model, sequence, vocab, device, top_k=5):
             
         return predictions
 
+def evaluate_all_models(test_sequences, device):
+    print("\n=== Evaluating All Saved Models ===")
+    print("-" * 50)
+    
+    # Get all model files from saved_models directory
+    model_files = [f for f in os.listdir('saved_models') if f.endswith('.pt')]
+    model_files.sort()  # Sort to evaluate in chronological order
+    
+    for model_file in model_files:
+        print(f"\nEvaluating model: {model_file}")
+        print("-" * 30)
+        
+        # Load model and vocabulary
+        checkpoint = torch.load(os.path.join('saved_models', model_file))
+        vocab = checkpoint['vocab']
+        model = LightweightTransformer(len(vocab)).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        # Print model info
+        print(f"Epoch: {checkpoint['epoch']}")
+        print(f"Loss: {checkpoint['loss']:.4f}")
+        print(f"Vocabulary size: {len(vocab)}")
+        
+        # Make predictions
+        for sequence in test_sequences:
+            predictions = predict_next_word(model, sequence, vocab, device, top_k=3)
+            print(f"\nInput: {' '.join(sequence)}")
+            print("Top 3 predictions:")
+            for i, (word, prob) in enumerate(predictions, 1):
+                print(f"{i}. {word} ({prob:.2%})")
+        print("-" * 30)
+
 def main():
     with open('dataset.txt', 'r', encoding='utf-8') as f:
         text = f.read()
     preprocessor = TextPreprocessor(min_freq=1, max_vocab_size=10000)
     processed_tokens = preprocessor.preprocess_text(text)
     preprocessor.create_vocab(processed_tokens)
+    
     seq_length = 16
+    batch_size = 128
+    
     sequences, targets = preprocessor.create_sequences(processed_tokens, seq_length)
     dataset = TextDataset(sequences, targets)
-    train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = LightweightTransformer(len(preprocessor.vocab)).to(device)
@@ -240,27 +278,26 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     
-    train_model(model, train_loader, optimizer, criterion, device)
+    # Print some information about the dataset
+    print(f"\nDataset Information:")
+    print(f"Vocabulary size: {len(preprocessor.vocab)}")
+    print(f"Number of sequences: {len(sequences)}")
+    print(f"Sequence length: {seq_length}")
+    print(f"Batch size: {batch_size}")
+    
+    train_model(model, train_loader, optimizer, criterion, device, preprocessor.vocab)
     
     test_sequences = [
-        ["this", "is", "a", "test", "sentence"],
-        ["the", "weather", "is", "very", "nice"],
+        ["this", "is", "a", "test", "sentence", "I", "want", "to", "see"],
+        ["the", "weather", "is", "very", "nice" "today", "I", "wonder"],
         ["i", "would", "like", "to", "go"]
     ]
     
-    print("\nPredicting next words (top 3 choices):")
-    print("-" * 50)
-    
-    for sequence in test_sequences:
-        predictions = predict_next_word(model, sequence, preprocessor.vocab, device, top_k=3)
-        print(f"\nInput: {' '.join(sequence)}")
-        print("Top 3 predictions:")
-        for i, (word, prob) in enumerate(predictions, 1):
-            print(f"{i}. {word} ({prob:.2%})")
-        print("-" * 50)
+    # Evaluate all saved models
+    evaluate_all_models(test_sequences, device)
 
 def test_preprocessor():
-    preprocessor = TextPreprocessor(min_freq=2, max_vocab_size=10000)
+    preprocessor = TextPreprocessor(min_freq=2, max_vocab_size=30000)
     text = "This is a test sentence. The weather is very nice. I would like to go."
     
     # Process text and show results
@@ -350,7 +387,7 @@ def test_dataset_creation():
         print("Batch target shape:", batch[1].shape)
         print("Expected shapes:")
         print(f"- Sequences: torch.Size([{batch_size}, {seq_length}])")
-        print(f"- Targets: torch.Size([{batch_size}])")
+        print(f"- Targets: torch.Size([{batch_size}, {seq_length}])")
 
 def test_model_tensor_dimensions():
     print("\n=== Testing Model Tensor Dimensions ===")
